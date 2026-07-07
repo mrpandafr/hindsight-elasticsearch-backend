@@ -287,3 +287,7 @@ SOFTWARE.
 
 *Hindsight™ is a trademark of Vectorize AI, Inc. This is a community
 backend contribution and is not officially endorsed by Vectorize.*
+
+---
+
+*Built with 🐢 by K1SS Atelier 0 — JS & Kage. Besançon, France.*
