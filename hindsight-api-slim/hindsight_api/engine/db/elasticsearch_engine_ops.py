@@ -417,3 +417,370 @@ async def finalize_document(
         doc_as_upsert=True,
         refresh="wait_for",
     )
+
+
+# ---------------------------------------------------------------------------
+# Block 1 — operation completion & parent/sibling rollup (async_operations)
+# ---------------------------------------------------------------------------
+# Native counterparts of _mark_operation_completed_and_fire_webhook /
+# _maybe_update_parent_operation. The SQL transaction + FOR UPDATE become:
+# read the parent with seq_no/primary_term, decide from the siblings, then
+# conditional-update; a 409 means another child won the race — re-read and
+# retry the whole decision (the engine snippet loops, bounded).
+
+def _parse_dt_field(value: Any) -> Any:
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return value
+
+
+async def get_operation_metadata(conn: Any, table: str, operation_id: str) -> dict | None:
+    """``SELECT result_metadata WHERE operation_id=$1`` — parsed dict, or
+    None when the row is gone. The outcome-metadata write pairs this with
+    set_operation_result_metadata(..., merge=True) (the jsonb ``||``)."""
+    try:
+        got = await _client(conn).get(index=_index(table), id=str(operation_id),
+                                      source_includes=["result_metadata"])
+    except Exception as exc:
+        if _status_of(exc) == 404:
+            return None
+        raise
+    meta = got.get("_source", {}).get("result_metadata")
+    return _load_json(meta, {}) if isinstance(meta, str) else (meta or {})
+
+
+async def get_operation_fields(
+    conn: Any, table: str, operation_id: str, fields: list[str],
+    *, with_concurrency: bool = False,
+) -> dict | None:
+    """Field projection of one operation row; with_concurrency=True also
+    returns _seq_no/_primary_term — the FOR UPDATE handle for conditional
+    parent updates."""
+    try:
+        got = await _client(conn).get(index=_index(table), id=str(operation_id),
+                                      source_includes=fields)
+    except Exception as exc:
+        if _status_of(exc) == 404:
+            return None
+        raise
+    row = dict(got.get("_source", {}))
+    if isinstance(row.get("result_metadata"), str):
+        row["result_metadata"] = _load_json(row["result_metadata"], {})
+    if with_concurrency:
+        row["_seq_no"], row["_primary_term"] = got.get("_seq_no"), got.get("_primary_term")
+    return row
+
+
+async def mark_operation_completed(conn: Any, table: str, operation_id: str) -> bool:
+    """``UPDATE ... SET status='completed', updated_at=NOW(), completed_at=NOW()
+    RETURNING operation_id`` — False when the row no longer exists (bank
+    deleted), the engine's skip signal. The webhook outbox row goes through
+    ops.insert_webhook_delivery_task in the same flow; without transactions
+    the ordering (status first, outbox second, both idempotent) is the
+    at-least-once guarantee."""
+    now = _iso(datetime.now(timezone.utc))
+    try:
+        await _client(conn).update(
+            index=_index(table), id=str(operation_id),
+            doc={"status": "completed", "updated_at": now, "completed_at": now},
+            refresh="wait_for",
+        )
+        return True
+    except Exception as exc:
+        if _status_of(exc) == 404:
+            return False
+        raise
+
+
+async def find_child_operations(
+    conn: Any, table: str, bank_id: str, parent_operation_id: str,
+) -> list[dict]:
+    """``WHERE result_metadata @> {"parent_operation_id": X}`` — the sibling
+    scan. ES: term on the dynamic subfield (keyword and raw text forms both
+    tried; UUIDs single-token lowercase match either). Returns rows with
+    status / error_message / result_metadata (parsed)."""
+    pid = str(parent_operation_id)
+    resp = await _client(conn).search(
+        index=_index(table),
+        body={
+            "query": {"bool": {
+                "filter": [{"term": {"bank_id": bank_id}}],
+                "should": [
+                    {"term": {"result_metadata.parent_operation_id.keyword": pid}},
+                    {"term": {"result_metadata.parent_operation_id": pid}},
+                ],
+                "minimum_should_match": 1,
+            }},
+            "size": 10000,
+            "_source": ["status", "error_message", "result_metadata"],
+            "track_total_hits": False,
+        },
+    )
+    rows: list[dict] = []
+    for h in resp["hits"]["hits"]:
+        src = h["_source"]
+        meta = src.get("result_metadata")
+        rows.append({
+            "status": src.get("status"),
+            "error_message": src.get("error_message"),
+            "result_metadata": _load_json(meta, {}) if isinstance(meta, str) else (meta or {}),
+        })
+    return rows
+
+
+async def update_operation_conditional(
+    conn: Any, table: str, operation_id: str, doc: dict,
+    *, seq_no: int, primary_term: int,
+    merge_metadata: dict | None = None,
+) -> bool:
+    """Conditional parent update — the FOR UPDATE replacement. False on 409
+    (another child finalized concurrently: re-read siblings and retry) or
+    404 (parent gone)."""
+    client, idx = _client(conn), _index(table)
+    payload = dict(doc)
+    payload["updated_at"] = _iso(datetime.now(timezone.utc))
+    if merge_metadata:
+        current = await get_operation_metadata(conn, table, operation_id) or {}
+        current.update(merge_metadata)
+        payload["result_metadata"] = current
+    try:
+        await client.update(index=idx, id=str(operation_id), doc=payload,
+                            if_seq_no=seq_no, if_primary_term=primary_term,
+                            refresh="wait_for")
+        return True
+    except Exception as exc:
+        if _status_of(exc) in (404, 409):
+            return False
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Block 2 — recall enrichment reads (observations, chunks, source facts,
+# entities). All read-only; date fields come back as datetimes because the
+# engine calls .isoformat() on them (the asyncpg contract).
+# ---------------------------------------------------------------------------
+
+async def fetch_observation_sources(
+    conn: Any, table: str, observation_ids: list,
+) -> list[dict]:
+    """``SELECT id, source_memory_ids WHERE id=ANY($1) AND
+    fact_type='observation'`` — serves both the prefer_observations dedup
+    (superseded raw facts) and the source-fact enrichment."""
+    ids = [str(i) for i in observation_ids]
+    if not ids:
+        return []
+    rows: list[dict] = []
+    for start in range(0, len(ids), 10000):
+        resp = await _client(conn).search(
+            index=_index(table),
+            body={
+                "query": {"bool": {"filter": [
+                    {"terms": {"id": ids[start:start + 10000]}},
+                    {"term": {"fact_type": "observation"}},
+                ]}},
+                "size": 10000,
+                "_source": ["id", "source_memory_ids"],
+                "track_total_hits": False,
+            },
+        )
+        for h in resp["hits"]["hits"]:
+            src = h["_source"]
+            rows.append({"id": str(src.get("id", h["_id"])),
+                         "source_memory_ids": [str(s) for s in src.get("source_memory_ids") or []]})
+    return rows
+
+
+async def fetch_observation_source_chunks(
+    conn: Any, fq_table: Callable[[str], str], observation_ids_ordered: list,
+) -> list[dict]:
+    """Rows ``{obs_id, chunk_id}`` in observation-rank order (the
+    ``array_position`` ORDER BY): observations' source units that carry a
+    chunk_id. Two terms queries replace the self-join."""
+    obs_rows = await fetch_observation_sources(
+        conn, fq_table("memory_units"), observation_ids_ordered
+    )
+    by_obs = {r["id"]: r["source_memory_ids"] for r in obs_rows}
+    all_sources = sorted({s for sids in by_obs.values() for s in sids})
+    chunk_by_unit: dict[str, str] = {}
+    for start in range(0, len(all_sources), 10000):
+        resp = await _client(conn).search(
+            index=_index(fq_table("memory_units")),
+            body={
+                "query": {"bool": {
+                    "filter": [{"terms": {"id": all_sources[start:start + 10000]}}],
+                    "must": [{"exists": {"field": "chunk_id"}}],
+                }},
+                "size": 10000,
+                "_source": ["id", "chunk_id"],
+                "track_total_hits": False,
+            },
+        )
+        for h in resp["hits"]["hits"]:
+            src = h["_source"]
+            chunk_by_unit[str(src["id"])] = str(src["chunk_id"])
+    out: list[dict] = []
+    for obs_id in (str(o) for o in observation_ids_ordered):
+        for sid in by_obs.get(obs_id, []):
+            cid = chunk_by_unit.get(sid)
+            if cid:
+                out.append({"obs_id": obs_id, "chunk_id": cid})
+    return out
+
+
+async def fetch_chunks_by_ids(conn: Any, table: str, chunk_ids: list[str]) -> list[dict]:
+    """``SELECT chunk_id, chunk_text, chunk_index WHERE chunk_id=ANY($1)``."""
+    ids = [str(c) for c in chunk_ids]
+    rows: list[dict] = []
+    for start in range(0, len(ids), 10000):
+        resp = await _client(conn).search(
+            index=_index(table),
+            body={
+                "query": {"terms": {"chunk_id": ids[start:start + 10000]}},
+                "size": 10000,
+                "_source": ["chunk_id", "chunk_text", "chunk_index"],
+                "track_total_hits": False,
+            },
+        )
+        rows.extend({"chunk_id": h["_source"].get("chunk_id"),
+                     "chunk_text": h["_source"].get("chunk_text"),
+                     "chunk_index": h["_source"].get("chunk_index")}
+                    for h in resp["hits"]["hits"])
+    return rows
+
+
+_SOURCE_FACT_FIELDS = ["id", "text", "fact_type", "context", "occurred_start",
+                       "occurred_end", "mentioned_at", "document_id",
+                       "chunk_id", "tags", "metadata"]
+
+
+async def fetch_units_by_ids(conn: Any, table: str, unit_ids: list) -> list[dict]:
+    """Source-fact hydration (``SELECT id, text, ... WHERE id=ANY($1)``).
+    Date columns are parsed back to datetimes — the engine calls
+    ``.isoformat()`` on them, per the asyncpg row contract."""
+    ids = [str(i) for i in unit_ids]
+    rows: list[dict] = []
+    for start in range(0, len(ids), 10000):
+        resp = await _client(conn).search(
+            index=_index(table),
+            body={
+                "query": {"terms": {"id": ids[start:start + 10000]}},
+                "size": 10000,
+                "_source": _SOURCE_FACT_FIELDS,
+                "track_total_hits": False,
+            },
+        )
+        for h in resp["hits"]["hits"]:
+            src = h["_source"]
+            row = {f: src.get(f) for f in _SOURCE_FACT_FIELDS}
+            row["id"] = str(row.get("id") or h["_id"])
+            for f in ("occurred_start", "occurred_end", "mentioned_at"):
+                row[f] = _parse_dt_field(row[f])
+            rows.append(row)
+    return rows
+
+
+async def fetch_entities_for_units(
+    conn: Any, fq_table: Callable[[str], str], unit_ids: list,
+) -> list[dict]:
+    """``_entity_rows_for_units_sql`` equivalent: rows
+    ``{unit_id, entity_id, canonical_name}`` resolving direct unit_entities
+    rows AND observation inheritance (an observation exposes the entities of
+    its source_memory_ids)."""
+    client = _client(conn)
+    ids = [str(i) for i in unit_ids]
+    if not ids:
+        return []
+    # observation inheritance map: obs -> sources
+    obs_rows = await fetch_observation_sources(conn, fq_table("memory_units"), ids)
+    sources_of = {r["id"]: r["source_memory_ids"] for r in obs_rows}
+    lookup_ids = sorted(set(ids) | {s for sids in sources_of.values() for s in sids})
+
+    entity_ids_by_unit: dict[str, list[str]] = {}
+    for start in range(0, len(lookup_ids), 10000):
+        resp = await client.search(
+            index=_index(fq_table("unit_entities")),
+            body={"query": {"terms": {"unit_id": lookup_ids[start:start + 10000]}},
+                  "size": 10000, "_source": ["unit_id", "entity_id"],
+                  "track_total_hits": False},
+        )
+        for h in resp["hits"]["hits"]:
+            src = h["_source"]
+            entity_ids_by_unit.setdefault(str(src["unit_id"]), []).append(str(src["entity_id"]))
+
+    all_entities = sorted({e for es in entity_ids_by_unit.values() for e in es})
+    name_of: dict[str, str] = {}
+    for start in range(0, len(all_entities), 10000):
+        resp = await client.search(
+            index=_index(fq_table("entities")),
+            body={"query": {"terms": {"id": all_entities[start:start + 10000]}},
+                  "size": 10000, "_source": ["id", "canonical_name"],
+                  "track_total_hits": False},
+        )
+        for h in resp["hits"]["hits"]:
+            src = h["_source"]
+            name_of[str(src["id"])] = src.get("canonical_name")
+
+    out: list[dict] = []
+    for uid in ids:
+        direct = entity_ids_by_unit.get(uid, [])
+        inherited = [e for sid in sources_of.get(uid, [])
+                     for e in entity_ids_by_unit.get(sid, [])]
+        seen: set[str] = set()
+        for eid in direct + inherited:
+            if eid in seen:
+                continue
+            seen.add(eid)
+            out.append({"unit_id": uid, "entity_id": eid,
+                        "canonical_name": name_of.get(eid)})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# @es_native — the dispatch decorator (plan-claude-decorators.md, no new file)
+# ---------------------------------------------------------------------------
+
+def es_native(native_fn: Callable) -> Callable:
+    """Route a SQL-bodied coroutine to its ES-native twin when the backend is
+    Elasticsearch; run the original otherwise.
+
+    The dispatch key is discovered on the call arguments themselves: the
+    first positional/keyword value exposing ``backend_type`` (conn, pool or
+    backend), unwrapping one level of ``_pool``/``_backend``/``client``
+    wrappers (BudgetedPool et al.). Signatures must match — the native twin
+    receives the exact same ``*args, **kwargs``.
+
+        @es_native(list_tags_paginated)
+        async def _list_tags_from_table(self, conn, table, ...):
+            ...  # SQL body, never runs under ES
+    """
+    import functools
+    import inspect
+
+    def _backend_type_of(value: Any) -> str | None:
+        bt = getattr(value, "backend_type", None)
+        if isinstance(bt, str):
+            return bt
+        for attr in ("_pool", "_backend", "pool", "backend"):
+            inner = getattr(value, attr, None)
+            bt = getattr(inner, "backend_type", None)
+            if isinstance(bt, str):
+                return bt
+        return None
+
+    def decorator(sql_fn: Callable) -> Callable:
+        @functools.wraps(sql_fn)
+        async def wrapper(*args: Any, **kwargs: Any):
+            for value in list(args) + list(kwargs.values()):
+                bt = _backend_type_of(value)
+                if bt is not None:
+                    if bt == "elasticsearch":
+                        result = native_fn(*args, **kwargs)
+                        return await result if inspect.isawaitable(result) else result
+                    break
+            return await sql_fn(*args, **kwargs)
+        return wrapper
+
+    return decorator
